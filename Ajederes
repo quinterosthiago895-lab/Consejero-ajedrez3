@@ -1,0 +1,403 @@
+name: Build APK
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: android-actions/setup-android@v3
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.7"
+      - name: Crear proyecto
+        run: |
+            mkdir -p "$(dirname 'build.gradle.kts')"
+            cat > 'build.gradle.kts' <<'EOF_FILE'
+            plugins {
+                id("com.android.application") version "8.5.2" apply false
+                id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+            }
+            EOF_FILE
+            mkdir -p "$(dirname 'gradle.properties')"
+            cat > 'gradle.properties' <<'EOF_FILE'
+            org.gradle.jvmargs=-Xmx2048m
+            android.useAndroidX=true
+            EOF_FILE
+            mkdir -p "$(dirname 'settings.gradle.kts')"
+            cat > 'settings.gradle.kts' <<'EOF_FILE'
+            pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+            dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+            rootProject.name = "ConsejeroAjedrez"
+            include(":app")
+            EOF_FILE
+            mkdir -p "$(dirname 'app/build.gradle.kts')"
+            cat > 'app/build.gradle.kts' <<'EOF_FILE'
+            plugins {
+                id("com.android.application")
+                id("org.jetbrains.kotlin.android")
+            }
+            android {
+                namespace = "com.ajedrez.consejero"
+                compileSdk = 34
+                defaultConfig {
+                    applicationId = "com.ajedrez.consejero"
+                    minSdk = 26
+                    targetSdk = 34
+                    versionCode = 1
+                    versionName = "1.0"
+                }
+                compileOptions {
+                    sourceCompatibility = JavaVersion.VERSION_17
+                    targetCompatibility = JavaVersion.VERSION_17
+                }
+                kotlinOptions { jvmTarget = "17" }
+            }
+            EOF_FILE
+            mkdir -p "$(dirname 'app/src/main/AndroidManifest.xml')"
+            cat > 'app/src/main/AndroidManifest.xml' <<'EOF_FILE'
+            <?xml version="1.0" encoding="utf-8"?>
+            <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+                <uses-permission android:name="android.permission.INTERNET" />
+                <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+                <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+                <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
+                <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+                <application
+                    android:label="Consejero de ajedrez"
+                    android:theme="@android:style/Theme.DeviceDefault.Light">
+                    <activity android:name=".MainActivity" android:exported="true">
+                        <intent-filter>
+                            <action android:name="android.intent.action.MAIN" />
+                            <category android:name="android.intent.category.LAUNCHER" />
+                        </intent-filter>
+                    </activity>
+                    <service
+                        android:name=".OverlayService"
+                        android:exported="false"
+                        android:foregroundServiceType="mediaProjection" />
+                </application>
+            </manifest>
+            EOF_FILE
+            mkdir -p "$(dirname 'app/src/main/java/com/ajedrez/consejero/MainActivity.kt')"
+            cat > 'app/src/main/java/com/ajedrez/consejero/MainActivity.kt' <<'EOF_FILE'
+            package com.ajedrez.consejero
+
+            import android.app.Activity
+            import android.content.Context
+            import android.content.Intent
+            import android.media.projection.MediaProjectionManager
+            import android.net.Uri
+            import android.os.Build
+            import android.os.Bundle
+            import android.provider.Settings
+            import android.widget.*
+
+            class MainActivity : Activity() {
+                private lateinit var keyBox: EditText
+                private lateinit var white: RadioButton
+
+                override fun onCreate(b: Bundle?) {
+                    super.onCreate(b)
+                    val prefs = getSharedPreferences("p", Context.MODE_PRIVATE)
+                    val pad = (20 * resources.displayMetrics.density).toInt()
+                    val root = LinearLayout(this).apply {
+                        orientation = LinearLayout.VERTICAL
+                        setPadding(pad, pad * 2, pad, pad)
+                    }
+                    root.addView(TextView(this).apply { text = "♞ Consejero de ajedrez"; textSize = 22f })
+                    root.addView(TextView(this).apply {
+                        text = "\nPega tu clave de API de Anthropic:"
+                    })
+                    keyBox = EditText(this).apply {
+                        setText(prefs.getString("key", ""))
+                        hint = "sk-ant-..."
+                        setSingleLine()
+                    }
+                    root.addView(keyBox)
+                    root.addView(TextView(this).apply { text = "\n¿Con qué color juegas?" })
+                    white = RadioButton(this).apply { text = "Blancas"; isChecked = prefs.getString("color", "blancas") == "blancas" }
+                    val black = RadioButton(this).apply { text = "Negras"; isChecked = !white.isChecked }
+                    root.addView(RadioGroup(this).apply { addView(white); addView(black) })
+                    root.addView(Button(this).apply {
+                        text = "Iniciar"
+                        setOnClickListener { iniciar() }
+                    })
+                    root.addView(Button(this).apply {
+                        text = "Detener"
+                        setOnClickListener { stopService(Intent(this@MainActivity, OverlayService::class.java)) }
+                    })
+                    root.addView(TextView(this).apply {
+                        text = "\nDespués de pulsar Iniciar, abre tu juego de ajedrez y toca el botón ♞ flotante para analizar el tablero."
+                    })
+                    setContentView(root)
+                    if (Build.VERSION.SDK_INT >= 33) {
+                        requestPermissions(arrayOf("android.permission.POST_NOTIFICATIONS"), 1)
+                    }
+                }
+
+                private fun iniciar() {
+                    val key = keyBox.text.toString().trim()
+                    if (key.isEmpty()) {
+                        Toast.makeText(this, "Falta la clave de API", Toast.LENGTH_SHORT).show(); return
+                    }
+                    getSharedPreferences("p", Context.MODE_PRIVATE).edit()
+                        .putString("key", key)
+                        .putString("color", if (white.isChecked) "blancas" else "negras").apply()
+                    if (!Settings.canDrawOverlays(this)) {
+                        Toast.makeText(this, "Activa «Mostrar sobre otras apps» y vuelve a pulsar Iniciar", Toast.LENGTH_LONG).show()
+                        startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))
+                        return
+                    }
+                    val mpm = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+                    @Suppress("DEPRECATION")
+                    startActivityForResult(mpm.createScreenCaptureIntent(), 100)
+                }
+
+                @Deprecated("Deprecated in Java")
+                override fun onActivityResult(req: Int, res: Int, data: Intent?) {
+                    super.onActivityResult(req, res, data)
+                    if (req == 100 && res == RESULT_OK && data != null) {
+                        val prefs = getSharedPreferences("p", Context.MODE_PRIVATE)
+                        val i = Intent(this, OverlayService::class.java)
+                            .putExtra("code", res)
+                            .putExtra("data", data)
+                            .putExtra("key", prefs.getString("key", ""))
+                            .putExtra("color", prefs.getString("color", "blancas"))
+                        startForegroundService(i)
+                        moveTaskToBack(true)
+                    }
+                }
+            }
+            EOF_FILE
+            mkdir -p "$(dirname 'app/src/main/java/com/ajedrez/consejero/OverlayService.kt')"
+            cat > 'app/src/main/java/com/ajedrez/consejero/OverlayService.kt' <<'EOF_FILE'
+            package com.ajedrez.consejero
+
+            import android.app.*
+            import android.content.Context
+            import android.content.Intent
+            import android.content.pm.ServiceInfo
+            import android.graphics.*
+            import android.hardware.display.DisplayManager
+            import android.hardware.display.VirtualDisplay
+            import android.media.ImageReader
+            import android.media.projection.MediaProjection
+            import android.media.projection.MediaProjectionManager
+            import android.os.*
+            import android.util.Base64
+            import android.util.DisplayMetrics
+            import android.view.*
+            import android.widget.TextView
+            import org.json.JSONArray
+            import org.json.JSONObject
+            import java.io.ByteArrayOutputStream
+            import java.net.HttpURLConnection
+            import java.net.URL
+            import kotlin.math.abs
+
+            class OverlayService : Service() {
+                private lateinit var wm: WindowManager
+                private var btn: TextView? = null
+                private var panel: TextView? = null
+                private var projection: MediaProjection? = null
+                private var reader: ImageReader? = null
+                private var vd: VirtualDisplay? = null
+                private var w = 0
+                private var h = 0
+                private var key = ""
+                private var color = "blancas"
+                private var busy = false
+                private val ui = Handler(Looper.getMainLooper())
+
+                override fun onBind(i: Intent?): IBinder? = null
+
+                override fun onStartCommand(i: Intent?, f: Int, id: Int): Int {
+                    if (i == null) { stopSelf(); return START_NOT_STICKY }
+                    startFg()
+                    key = i.getStringExtra("key") ?: ""
+                    color = i.getStringExtra("color") ?: "blancas"
+                    val mpm = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+                    @Suppress("DEPRECATION")
+                    val data = i.getParcelableExtra<Intent>("data")!!
+                    val p = mpm.getMediaProjection(i.getIntExtra("code", 0), data)
+                    projection = p
+                    p.registerCallback(object : MediaProjection.Callback() {
+                        override fun onStop() { stopSelf() }
+                    }, ui)
+                    wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+                    val m = DisplayMetrics()
+                    @Suppress("DEPRECATION")
+                    wm.defaultDisplay.getRealMetrics(m)
+                    w = m.widthPixels
+                    h = m.heightPixels
+                    val r = ImageReader.newInstance(w, h, PixelFormat.RGBA_8888, 2)
+                    reader = r
+                    vd = p.createVirtualDisplay(
+                        "cap", w, h, m.densityDpi,
+                        DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, r.surface, null, null
+                    )
+                    showButton()
+                    return START_NOT_STICKY
+                }
+
+                private fun startFg() {
+                    val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+                    nm.createNotificationChannel(NotificationChannel("ch", "Consejero", NotificationManager.IMPORTANCE_LOW))
+                    val n = Notification.Builder(this, "ch")
+                        .setContentTitle("Consejero de ajedrez activo")
+                        .setSmallIcon(android.R.drawable.ic_menu_info_details)
+                        .build()
+                    if (Build.VERSION.SDK_INT >= 29) {
+                        startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
+                    } else {
+                        startForeground(1, n)
+                    }
+                }
+
+                private fun lp(wid: Int, touchable: Boolean = true) = WindowManager.LayoutParams(
+                    wid, WindowManager.LayoutParams.WRAP_CONTENT,
+                    WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                    WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
+                    PixelFormat.TRANSLUCENT
+                ).apply { gravity = Gravity.TOP or Gravity.START }
+
+                private fun showButton() {
+                    val params = lp(WindowManager.LayoutParams.WRAP_CONTENT).apply { x = 20; y = 300 }
+                    val v = TextView(this).apply {
+                        text = "♞"
+                        textSize = 30f
+                        setTextColor(Color.WHITE)
+                        setBackgroundColor(0xCC2F6F4F.toInt())
+                        setPadding(30, 10, 30, 10)
+                    }
+                    var sx = 0; var sy = 0; var tx = 0f; var ty = 0f; var moved = false
+                    v.setOnTouchListener { _, e ->
+                        when (e.action) {
+                            MotionEvent.ACTION_DOWN -> { sx = params.x; sy = params.y; tx = e.rawX; ty = e.rawY; moved = false }
+                            MotionEvent.ACTION_MOVE -> {
+                                val dx = (e.rawX - tx).toInt(); val dy = (e.rawY - ty).toInt()
+                                if (abs(dx) > 10 || abs(dy) > 10) moved = true
+                                if (moved) { params.x = sx + dx; params.y = sy + dy; wm.updateViewLayout(v, params) }
+                            }
+                            MotionEvent.ACTION_UP -> if (!moved) analyze()
+                        }
+                        true
+                    }
+                    wm.addView(v, params)
+                    btn = v
+                }
+
+                private fun analyze() {
+                    if (busy) return
+                    busy = true
+                    removePanel()
+                    btn?.visibility = View.INVISIBLE
+                    ui.postDelayed({ capture(0) }, 300)
+                }
+
+                private fun capture(tries: Int) {
+                    val img = reader?.acquireLatestImage()
+                    if (img == null) {
+                        if (tries < 4) ui.postDelayed({ capture(tries + 1) }, 250)
+                        else show("No pude capturar la pantalla. Inténtalo de nuevo.")
+                        return
+                    }
+                    val pl = img.planes[0]
+                    val rowPad = pl.rowStride - pl.pixelStride * w
+                    val bmp = Bitmap.createBitmap(w + rowPad / pl.pixelStride, h, Bitmap.Config.ARGB_8888)
+                    bmp.copyPixelsFromBuffer(pl.buffer)
+                    img.close()
+                    btn?.visibility = View.VISIBLE
+                    show("Analizando…", keepBusy = true)
+                    Thread {
+                        val txt = try {
+                            val crop = Bitmap.createBitmap(bmp, 0, 0, w, h)
+                            val k = 1280f / maxOf(w, h)
+                            val sc = if (k < 1f) Bitmap.createScaledBitmap(crop, (w * k).toInt(), (h * k).toInt(), true) else crop
+                            val out = ByteArrayOutputStream()
+                            sc.compress(Bitmap.CompressFormat.JPEG, 85, out)
+                            callApi(Base64.encodeToString(out.toByteArray(), Base64.NO_WRAP))
+                        } catch (e: Exception) {
+                            "Error: ${e.message}"
+                        }
+                        ui.post { show(txt) }
+                    }.start()
+                }
+
+                private fun callApi(b64: String): String {
+                    val prompt = "Esta es una captura de una partida de ajedrez en mi celular. " +
+                        "Yo juego con las piezas $color y es mi turno. Lee el tablero con cuidado " +
+                        "(si no se ve bien, dilo). Responde en español, máximo 45 palabras: " +
+                        "1) la mejor jugada (pieza, de qué casilla a cuál) y 2) por qué, en una frase. " +
+                        "Si hay un peligro inmediato contra mí, avísalo primero."
+                    val content = JSONArray()
+                        .put(JSONObject().put("type", "image").put("source",
+                            JSONObject().put("type", "base64").put("media_type", "image/jpeg").put("data", b64)))
+                        .put(JSONObject().put("type", "text").put("text", prompt))
+                    val body = JSONObject()
+                        .put("model", "claude-sonnet-5-5")
+                        .put("max_tokens", 600)
+                        .put("messages", JSONArray().put(JSONObject().put("role", "user").put("content", content)))
+                    val c = URL("https://api.anthropic.com/v1/messages").openConnection() as HttpURLConnection
+                    c.requestMethod = "POST"
+                    c.connectTimeout = 20000
+                    c.readTimeout = 60000
+                    c.doOutput = true
+                    c.setRequestProperty("content-type", "application/json")
+                    c.setRequestProperty("x-api-key", key)
+                    c.setRequestProperty("anthropic-version", "2023-06-01")
+                    c.outputStream.use { it.write(body.toString().toByteArray()) }
+                    val code = c.responseCode
+                    val txt = (if (code == 200) c.inputStream else c.errorStream).bufferedReader().readText()
+                    if (code != 200) return "Error $code: revisa tu clave de API y tu saldo."
+                    return JSONObject(txt).getJSONArray("content").getJSONObject(0).getString("text")
+                }
+
+                private fun removePanel() {
+                    panel?.let { try { wm.removeView(it) } catch (_: Exception) {} }
+                    panel = null
+                }
+
+                private fun show(text: String, keepBusy: Boolean = false) {
+                    removePanel()
+                    btn?.visibility = View.VISIBLE
+                    val params = lp(WindowManager.LayoutParams.MATCH_PARENT).apply { y = 140 }
+                    val t = TextView(this).apply {
+                        this.text = text
+                        textSize = 17f
+                        setTextColor(Color.WHITE)
+                        setBackgroundColor(0xEE1D1B19.toInt())
+                        setPadding(40, 30, 40, 30)
+                        setOnClickListener { removePanel() }
+                    }
+                    wm.addView(t, params)
+                    panel = t
+                    busy = keepBusy
+                }
+
+                override fun onDestroy() {
+                    removePanel()
+                    btn?.let { try { wm.removeView(it) } catch (_: Exception) {} }
+                    vd?.release()
+                    reader?.close()
+                    projection?.stop()
+                    super.onDestroy()
+                }
+            }
+            EOF_FILE
+      - name: Compilar
+        run: gradle assembleDebug --no-daemon
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ github.run_number }}
+          name: Consejero de ajedrez v${{ github.run_number }}
+          files: app/build/outputs/apk/debug/app-debug.apk
